@@ -20,7 +20,9 @@ Diagnostic Mode (--check):
 
 from __future__ import annotations
 
+import asyncio
 import binascii
+import concurrent.futures
 import logging
 import os
 import signal
@@ -43,6 +45,7 @@ from fuzz_lab.core.controller import TargetController
 from fuzz_lab.core.engine_boofuzz import BoofuzzEngine
 from fuzz_lab.core.monitor import CoverageMonitor, LcovParser, PathRemapper
 from fuzz_lab.core.mutator_llm import LLMMutator
+from fuzz_lab.core.triage import CrashTriager, TriageResult
 from fuzz_lab.metrics.tracker import MeasurementMatrix
 
 logger = logging.getLogger(__name__)
@@ -430,6 +433,12 @@ class Orchestrator:
         self.engine: Optional[BoofuzzEngine] = None
         self.mutator: Optional[LLMMutator] = None
         self.tracker: Optional[MeasurementMatrix] = None
+        self.triager: Optional[CrashTriager] = None
+
+        # Async infrastructure for non-blocking LLM calls
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self._pending_llm_future: Optional[concurrent.futures.Future] = None
 
         self._iteration = 0
         self._running = False
@@ -468,6 +477,7 @@ class Orchestrator:
     def _initialise_components(self) -> None:
         self.controller = TargetController(self.target_spec, self.workspace)
         self.mutator = LLMMutator()
+        self.triager = CrashTriager(self.target_spec)
         self.tracker = MeasurementMatrix(
             output_path=EXPERIMENT_CONFIG["metrics_output"],
         )
@@ -550,6 +560,9 @@ class Orchestrator:
             self._on_crash(session, fuzz_data_logger)
             return
 
+        # Check for completed background LLM mutations
+        self._check_pending_llm_seeds(snapshot.unique_paths)
+
         # Stagnation check -> trigger LLM mutation
         if self.monitor.is_stagnant():
             self._trigger_llm_mutation(snapshot)
@@ -559,17 +572,41 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     def _on_crash(self, session, fuzz_data_logger) -> None:
-        """Freeze, log, restart, resume."""
+        """Freeze, triage, log, restart, resume."""
         logger.warning("Crash at iteration %d", self._iteration)
         self.engine.pause()
 
         # Capture the crashing input (best-effort)
         crash_input = self._last_seed or b"<unknown>"
 
+        # Triage: run gdb, extract backtrace, match CVEs
+        triage_result: Optional[TriageResult] = None
+        if self.triager and self.controller.container_id:
+            try:
+                triage_result = self.triager.triage_crash(
+                    container_id=self.controller.container_id,
+                    crash_input=crash_input,
+                )
+            except Exception as exc:
+                logger.warning("Crash triage failed: %s", exc)
+
+        # Determine signal and CVE match from triage
+        crash_signal = triage_result.crash_signal if triage_result else 11
+        backtrace = triage_result.backtrace if triage_result else ""
+        matched_cve = ""
+        cve_weight = 0
+        if triage_result and triage_result.matched_cves:
+            best_cve = triage_result.matched_cves[0]
+            matched_cve = best_cve.cve_id
+            cve_weight = best_cve.weight
+
         self.tracker.log_crash(
             iteration=self._iteration,
-            signal=11,  # SIGSEGV placeholder
+            signal=crash_signal,
             crash_input=crash_input,
+            backtrace=backtrace,
+            matched_cve=matched_cve,
+            cve_weight=cve_weight,
         )
 
         # Save crash artifact
@@ -579,6 +616,17 @@ class Orchestrator:
         )
         crash_path.write_bytes(crash_input)
         logger.info("Crash input saved to %s", crash_path)
+
+        if triage_result and triage_result.crashing_function:
+            logger.info(
+                "Triage: %s in %s:%d (signal %d, CVE match: %s [%s])",
+                triage_result.crashing_function,
+                triage_result.crashing_file,
+                triage_result.crashing_line,
+                crash_signal,
+                matched_cve or "none",
+                triage_result.confidence,
+            )
 
         # Restart target
         new_id = self.controller.restart_on_crash()
@@ -591,13 +639,26 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     def _trigger_llm_mutation(self, snapshot) -> None:
-        """Pause traditional fuzzing, generate LLM seeds, inject, resume."""
-        logger.info("Coverage stagnant at %d paths — invoking LLM mutator",
-                     snapshot.unique_paths)
-        self.engine.pause()
+        """Launch async LLM mutation without blocking the fuzz loop.
 
-        paths_before = snapshot.unique_paths
+        The LLM call runs in a background thread via asyncio.  When it
+        completes, _check_pending_llm_seeds() picks up the results and
+        injects them into Boofuzz.  Meanwhile, traditional fuzzing
+        continues uninterrupted.
+        """
+        # If a previous async LLM call is still in flight, skip
+        if self._pending_llm_future and not self._pending_llm_future.done():
+            logger.debug("LLM mutation already in progress — skipping")
+            return
+
+        # Check for results from previous async call first
+        self._check_pending_llm_seeds(snapshot.unique_paths)
+
+        logger.info("Coverage stagnant at %d paths — invoking LLM mutator (async)",
+                     snapshot.unique_paths)
+
         seed = self._last_seed or b"\x00" * 16
+        paths_before = snapshot.unique_paths
 
         # Pick a CVE hint based on weight (cycle through increasing difficulty)
         cve_idx = (self._iteration // COVERAGE_CONFIG["stagnation_window"]) % len(
@@ -609,30 +670,84 @@ class Orchestrator:
             if self.target_spec.rfc_references else ""
         )
 
-        seeds = self.mutator.generate_mutations(
-            seed=seed,
-            protocol=self.target_spec.protocol,
-            state="",
-            rfc_ref=rfc_ref,
-            cve_hint=cve.description,
+        # Launch LLM call in background thread so it doesn't block
+        self._pending_llm_future = self._executor.submit(
+            self._llm_generate_sync,
+            seed, cve, rfc_ref, paths_before,
         )
 
-        # Validate seeds (basic: non-empty, minimum length)
+    def _llm_generate_sync(
+        self, seed: bytes, cve, rfc_ref: str, paths_before: int,
+    ) -> dict:
+        """Synchronous wrapper called from the thread pool.
+
+        Tries async first (via a fresh event loop in this thread),
+        falls back to sync if aiohttp isn't available.
+        """
+        try:
+            loop = asyncio.new_event_loop()
+            seeds = loop.run_until_complete(
+                self.mutator.generate_mutations_async(
+                    seed=seed,
+                    protocol=self.target_spec.protocol,
+                    state="",
+                    rfc_ref=rfc_ref,
+                    cve_hint=cve.description,
+                )
+            )
+            loop.run_until_complete(self.mutator.close())
+            loop.close()
+        except Exception:
+            # Fallback to sync if aiohttp not installed
+            logger.debug("Async LLM call failed, falling back to sync")
+            seeds = self.mutator.generate_mutations(
+                seed=seed,
+                protocol=self.target_spec.protocol,
+                state="",
+                rfc_ref=rfc_ref,
+                cve_hint=cve.description,
+            )
+
+        return {
+            "seeds": seeds,
+            "iteration": self._iteration,
+            "paths_before": paths_before,
+        }
+
+    def _check_pending_llm_seeds(self, current_paths: int = 0) -> None:
+        """If the background LLM call has completed, inject its results."""
+        if self._pending_llm_future is None or not self._pending_llm_future.done():
+            return
+
+        try:
+            result = self._pending_llm_future.result(timeout=0)
+        except Exception as exc:
+            logger.warning("Background LLM mutation failed: %s", exc)
+            self._pending_llm_future = None
+            return
+
+        seeds = result["seeds"]
+        paths_before = result["paths_before"]
+
         valid_seeds = [s for s in seeds if len(s) >= 2]
 
         self.tracker.log_llm_batch(
-            iteration=self._iteration,
+            iteration=result["iteration"],
             seeds_requested=self.mutator.batch_size,
             seeds_returned=len(seeds),
             valid_seeds=len(valid_seeds),
-            new_paths_discovered=0,  # updated after injection
+            new_paths_discovered=max(0, current_paths - paths_before),
             traditional_paths_at_time=paths_before,
         )
 
         if valid_seeds:
             self.engine.inject_seeds(valid_seeds)
+            logger.info(
+                "Injected %d LLM seeds (requested at iter %d, paths then=%d now=%d)",
+                len(valid_seeds), result["iteration"], paths_before, current_paths,
+            )
 
-        self.engine.resume()
+        self._pending_llm_future = None
 
     # ------------------------------------------------------------------
     # Shutdown
@@ -640,6 +755,9 @@ class Orchestrator:
 
     def _shutdown(self) -> None:
         logger.info("Shutting down orchestrator")
+
+        # Shut down the LLM thread pool
+        self._executor.shutdown(wait=False)
 
         if self.tracker:
             self.tracker.stop_periodic_plotting()

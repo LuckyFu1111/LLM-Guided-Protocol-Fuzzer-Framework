@@ -4,12 +4,17 @@ LLMMutator — Ollama (Qwen3:8b) integration for semantic mutation.
 When coverage plateaus, this module composes context-rich prompts and asks
 the local LLM to generate protocol-aware fuzz seeds that target specific
 logic paths (identified by CVE descriptions or RFC sections).
+
+Provides both synchronous (requests) and asynchronous (aiohttp) APIs:
+  - call_ollama() / generate_mutations()  — blocking (for simple usage)
+  - call_ollama_async() / generate_mutations_async() — non-blocking (for
+    concurrent operation within the orchestrator's event loop)
 """
 
 from __future__ import annotations
 
+import asyncio
 import binascii
-import json
 import logging
 import re
 import time
@@ -23,7 +28,12 @@ logger = logging.getLogger(__name__)
 
 
 class LLMMutator:
-    """Generate fuzz seeds via Ollama's local inference API."""
+    """Generate fuzz seeds via Ollama's local inference API.
+
+    Supports both sync and async operation.  The async methods use aiohttp
+    so the orchestrator can issue LLM requests without blocking the fuzzing
+    loop.
+    """
 
     def __init__(
         self,
@@ -45,6 +55,9 @@ class LLMMutator:
         self.max_retries = max_retries
         self.batch_size = batch_size
         self._generate_url = f"{self.base_url}/api/generate"
+
+        # Lazy-initialised aiohttp session (created on first async call)
+        self._aio_session = None
 
     # ------------------------------------------------------------------
     # Prompt Composition
@@ -105,7 +118,7 @@ class LLMMutator:
         return "\n".join(parts)
 
     # ------------------------------------------------------------------
-    # Ollama API
+    # Synchronous Ollama API (requests)
     # ------------------------------------------------------------------
 
     def call_ollama(self, prompt: str) -> List[bytes]:
@@ -113,21 +126,10 @@ class LLMMutator:
 
         Returns a list of raw byte sequences for injection into the fuzzer.
         """
-        payload = {
-            "model": self.model,
-            "prompt": prompt,
-            "stream": False,
-            "options": {
-                "temperature": self.temperature,
-                "top_p": self.top_p,
-                "num_predict": self.num_predict,
-            },
-        }
-
-        raw_response = self._api_call(payload)
+        payload = self._build_payload(prompt)
+        raw_response = self._api_call_sync(payload)
         if raw_response is None:
             return []
-
         return self._parse_hex_seeds(raw_response)
 
     def generate_mutations(
@@ -140,11 +142,8 @@ class LLMMutator:
     ) -> List[bytes]:
         """End-to-end: compose prompt, call LLM, return parsed seeds."""
         prompt = self.compose_prompt(
-            seed=seed,
-            protocol=protocol,
-            state=state,
-            rfc_ref=rfc_ref,
-            cve_hint=cve_hint,
+            seed=seed, protocol=protocol, state=state,
+            rfc_ref=rfc_ref, cve_hint=cve_hint,
         )
         return self.call_ollama(prompt)
 
@@ -157,10 +156,74 @@ class LLMMutator:
             return False
 
     # ------------------------------------------------------------------
-    # Internal Helpers
+    # Asynchronous Ollama API (aiohttp)
     # ------------------------------------------------------------------
 
-    def _api_call(self, payload: dict) -> Optional[str]:
+    async def call_ollama_async(self, prompt: str) -> List[bytes]:
+        """Async version of call_ollama using aiohttp.
+
+        Does not block the event loop during LLM inference.
+        """
+        payload = self._build_payload(prompt)
+        raw_response = await self._api_call_async(payload)
+        if raw_response is None:
+            return []
+        return self._parse_hex_seeds(raw_response)
+
+    async def generate_mutations_async(
+        self,
+        seed: bytes,
+        protocol: str,
+        state: str = "",
+        rfc_ref: str = "",
+        cve_hint: str = "",
+    ) -> List[bytes]:
+        """Async end-to-end: compose prompt, call LLM, return parsed seeds."""
+        prompt = self.compose_prompt(
+            seed=seed, protocol=protocol, state=state,
+            rfc_ref=rfc_ref, cve_hint=cve_hint,
+        )
+        return await self.call_ollama_async(prompt)
+
+    async def is_available_async(self) -> bool:
+        """Async check if Ollama server is reachable."""
+        session = await self._get_aio_session()
+        try:
+            async with session.get(
+                f"{self.base_url}/api/tags",
+                timeout=_aio_timeout(5),
+            ) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
+
+    async def close(self) -> None:
+        """Close the aiohttp session. Call on shutdown."""
+        if self._aio_session is not None and not self._aio_session.closed:
+            await self._aio_session.close()
+            self._aio_session = None
+
+    # ------------------------------------------------------------------
+    # Shared Helpers
+    # ------------------------------------------------------------------
+
+    def _build_payload(self, prompt: str) -> dict:
+        return {
+            "model": self.model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": self.temperature,
+                "top_p": self.top_p,
+                "num_predict": self.num_predict,
+            },
+        }
+
+    # ------------------------------------------------------------------
+    # Sync internals (requests)
+    # ------------------------------------------------------------------
+
+    def _api_call_sync(self, payload: dict) -> Optional[str]:
         """Make the HTTP call with retries and exponential backoff."""
         for attempt in range(1, self.max_retries + 1):
             try:
@@ -183,6 +246,47 @@ class LLMMutator:
 
         logger.error("Ollama call failed after %d attempts", self.max_retries)
         return None
+
+    # ------------------------------------------------------------------
+    # Async internals (aiohttp)
+    # ------------------------------------------------------------------
+
+    async def _get_aio_session(self):
+        """Lazily create and return the aiohttp ClientSession."""
+        if self._aio_session is None or self._aio_session.closed:
+            import aiohttp
+            self._aio_session = aiohttp.ClientSession()
+        return self._aio_session
+
+    async def _api_call_async(self, payload: dict) -> Optional[str]:
+        """Async HTTP call with retries and exponential backoff."""
+        session = await self._get_aio_session()
+
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                async with session.post(
+                    self._generate_url,
+                    json=payload,
+                    timeout=_aio_timeout(self.timeout),
+                ) as resp:
+                    resp.raise_for_status()
+                    data = await resp.json()
+                    return data.get("response", "")
+            except Exception as exc:
+                wait = 2 ** attempt
+                logger.warning(
+                    "Async Ollama call attempt %d/%d failed: %s — retrying in %ds",
+                    attempt, self.max_retries, exc, wait,
+                )
+                if attempt < self.max_retries:
+                    await asyncio.sleep(wait)
+
+        logger.error("Async Ollama call failed after %d attempts", self.max_retries)
+        return None
+
+    # ------------------------------------------------------------------
+    # Hex Parser
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _parse_hex_seeds(raw: str) -> List[bytes]:
@@ -213,3 +317,9 @@ class LLMMutator:
                     continue
 
         return seeds
+
+
+def _aio_timeout(seconds: int):
+    """Create an aiohttp ClientTimeout from a single total-seconds value."""
+    import aiohttp
+    return aiohttp.ClientTimeout(total=seconds)
