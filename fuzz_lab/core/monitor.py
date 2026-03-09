@@ -4,26 +4,30 @@ CoverageMonitor — GCOV/LCOV integration for coverage-guided fuzzing.
 Responsibilities:
   1. Trigger gcov data flush inside the Docker container.
   2. Run lcov to collect coverage into a .info tracefile.
-  3. Parse the tracefile to extract total lines, lines hit, branches hit,
+  3. Remap container-absolute paths to host-relative paths so host-side
+     tools (lcov, genhtml) can resolve source files.
+  4. Parse the tracefile to extract total lines, lines hit, branches hit,
      and unique-path counts.
-  4. Detect stagnation (no new coverage in a sliding window of iterations).
+  5. Detect stagnation (no new coverage in a sliding window of iterations).
 
-The parser handles the standard LCOV tracefile format:
-  TN:   — test name
-  SF:   — source file
-  DA:   — line data  (DA:<line_number>,<execution_count>)
-  LF:   — lines found (total instrumentable lines in that source file)
-  LH:   — lines hit   (lines executed at least once)
-  BRDA: — branch data (BRDA:<line>,<block>,<branch>,<taken>)
-  BRF:  — branches found
-  BRH:  — branches hit
+Path Remapping Problem:
+  GCOV/LCOV tracefiles contain absolute paths as they exist *inside* the
+  container, e.g.  ``SF:/usr/src/bind9/lib/dns/message.c``
+  On the macOS host the source tree lives at a different location, e.g.
+  ``/Users/me/fuzz_lab/targets/bind9/src/lib/dns/message.c``
+  The PathRemapper rewrites SF: lines before parsing so that all downstream
+  consumers see host-relative paths.
+
+Retry Logic:
+  GCOV .gcda files may be locked or temporarily empty while the target
+  process is in the middle of a write.  All file operations that touch
+  coverage data retry with exponential backoff.
 """
 
 from __future__ import annotations
 
 import hashlib
 import logging
-import os
 import re
 import subprocess
 import tempfile
@@ -34,6 +38,74 @@ from pathlib import Path
 from typing import Deque, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
+
+# Default retry parameters for GCOV file operations
+_GCOV_MAX_RETRIES = 4
+_GCOV_BACKOFF_BASE = 0.5  # seconds; retries at 0.5, 1, 2, 4s
+
+
+# ---------------------------------------------------------------------------
+# Path Remapper
+# ---------------------------------------------------------------------------
+
+class PathRemapper:
+    """Rewrite container-absolute paths in LCOV tracefiles to host paths.
+
+    Parameters
+    ----------
+    mappings : list of (container_prefix, host_prefix) tuples
+        Each pair maps a container path prefix to its host-side equivalent.
+        Evaluated in order; first match wins.
+
+    Example::
+
+        remapper = PathRemapper([
+            ("/usr/src/bind9", "/Users/me/fuzz_lab/targets/bind9/src"),
+        ])
+        host_path = remapper.remap("/usr/src/bind9/lib/dns/message.c")
+        # -> "/Users/me/fuzz_lab/targets/bind9/src/lib/dns/message.c"
+    """
+
+    def __init__(self, mappings: List[Tuple[str, str]] | None = None) -> None:
+        # Normalise: strip trailing slashes for consistent prefix matching
+        self.mappings: List[Tuple[str, str]] = []
+        for container_pfx, host_pfx in (mappings or []):
+            self.mappings.append((
+                container_pfx.rstrip("/"),
+                host_pfx.rstrip("/"),
+            ))
+
+    def remap(self, container_path: str) -> str:
+        """Return the host-side path for a container-absolute path.
+
+        If no mapping matches, the original path is returned unchanged.
+        """
+        for container_pfx, host_pfx in self.mappings:
+            if container_path.startswith(container_pfx):
+                suffix = container_path[len(container_pfx):]
+                return host_pfx + suffix
+        return container_path
+
+    def remap_lcov_content(self, content: str) -> str:
+        """Rewrite every ``SF:`` line in an LCOV tracefile string."""
+        lines = content.splitlines(keepends=True)
+        out: list[str] = []
+        for line in lines:
+            if line.startswith("SF:"):
+                original = line[3:].rstrip("\n\r")
+                remapped = self.remap(original)
+                out.append(f"SF:{remapped}\n")
+            else:
+                out.append(line)
+        return "".join(out)
+
+    def remap_lcov_file(self, info_path: Path) -> None:
+        """In-place rewrite of SF: lines in an LCOV .info file on disk."""
+        content = info_path.read_text(encoding="utf-8", errors="replace")
+        remapped = self.remap_lcov_content(content)
+        if remapped != content:
+            info_path.write_text(remapped, encoding="utf-8")
+            logger.debug("Remapped paths in %s", info_path)
 
 
 # ---------------------------------------------------------------------------
@@ -103,21 +175,45 @@ class CoverageSnapshot:
 # ---------------------------------------------------------------------------
 
 class LcovParser:
-    """Parse an LCOV .info tracefile into a CoverageSnapshot."""
+    """Parse an LCOV .info tracefile into a CoverageSnapshot.
+
+    Optionally applies path remapping before parsing so that SF: lines
+    reference host-side paths instead of container-internal paths.
+    """
 
     # Precompiled regexes for hot-path parsing
     _RE_DA = re.compile(r"^DA:(\d+),(\d+)")
     _RE_BRDA = re.compile(r"^BRDA:(\d+),(\d+),(\d+),(-|\d+)")
 
     @classmethod
-    def parse_file(cls, info_path: str | Path, iteration: int = 0) -> CoverageSnapshot:
-        """Read an lcov .info file from disk and return a CoverageSnapshot."""
+    def parse_file(
+        cls,
+        info_path: str | Path,
+        iteration: int = 0,
+        remapper: PathRemapper | None = None,
+    ) -> CoverageSnapshot:
+        """Read an lcov .info file from disk and return a CoverageSnapshot.
+
+        Parameters
+        ----------
+        info_path : path
+            Local path to the .info tracefile.
+        iteration : int
+            Current fuzzing iteration (for bookkeeping).
+        remapper : PathRemapper, optional
+            If provided, SF: lines are rewritten before parsing.
+        """
         info_path = Path(info_path)
         if not info_path.exists():
             raise FileNotFoundError(f"LCOV tracefile not found: {info_path}")
 
-        with open(info_path, "r", encoding="utf-8", errors="replace") as fh:
-            return cls.parse_lines(fh.readlines(), iteration=iteration)
+        content = info_path.read_text(encoding="utf-8", errors="replace")
+
+        # Apply path remapping if configured
+        if remapper:
+            content = remapper.remap_lcov_content(content)
+
+        return cls.parse_lines(content.splitlines(), iteration=iteration)
 
     @classmethod
     def parse_lines(cls, lines: List[str], iteration: int = 0) -> CoverageSnapshot:
@@ -185,6 +281,38 @@ class LcovParser:
 
 
 # ---------------------------------------------------------------------------
+# Retry helper
+# ---------------------------------------------------------------------------
+
+def _retry_operation(
+    operation,
+    description: str,
+    max_retries: int = _GCOV_MAX_RETRIES,
+    backoff_base: float = _GCOV_BACKOFF_BASE,
+):
+    """Execute *operation* with retries and exponential backoff.
+
+    Catches OSError (file locked / empty / permission) and
+    subprocess.CalledProcessError (lcov transient failure).
+    """
+    last_exc = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            return operation()
+        except (OSError, subprocess.CalledProcessError, FileNotFoundError) as exc:
+            last_exc = exc
+            wait = backoff_base * (2 ** (attempt - 1))
+            logger.warning(
+                "%s: attempt %d/%d failed (%s) — retrying in %.1fs",
+                description, attempt, max_retries, exc, wait,
+            )
+            time.sleep(wait)
+
+    logger.error("%s: all %d attempts failed", description, max_retries)
+    raise last_exc  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
 # CoverageMonitor — live interaction with a running Docker container
 # ---------------------------------------------------------------------------
 
@@ -197,6 +325,12 @@ class CoverageMonitor:
         Docker container ID or name.
     gcov_prefix : str
         Absolute path inside the container where .gcda files land.
+    source_prefix_container : str
+        Absolute path to the source tree *inside* the container
+        (e.g. ``/usr/src/bind9``).
+    source_prefix_host : str
+        Corresponding path on the host (e.g. ``./targets/bind9/src``).
+        Pass empty string to disable remapping.
     local_lcov_dir : str | Path | None
         Local directory for pulled .info files.  Created on demand.
     stagnation_window : int
@@ -211,6 +345,8 @@ class CoverageMonitor:
         self,
         container_id: str,
         gcov_prefix: str,
+        source_prefix_container: str = "",
+        source_prefix_host: str = "",
         local_lcov_dir: str | Path | None = None,
         stagnation_window: int = 500,
         gcov_flush_cmd: str = "kill -USR1 1",
@@ -221,6 +357,12 @@ class CoverageMonitor:
         self.local_lcov_dir.mkdir(parents=True, exist_ok=True)
         self.stagnation_window = stagnation_window
         self.gcov_flush_cmd = gcov_flush_cmd
+
+        # Path remapping (container paths → host paths)
+        mappings: List[Tuple[str, str]] = []
+        if source_prefix_container and source_prefix_host:
+            mappings.append((source_prefix_container, source_prefix_host))
+        self._remapper = PathRemapper(mappings) if mappings else None
 
         # Rolling history for stagnation detection
         self._path_history: Deque[int] = deque(maxlen=stagnation_window)
@@ -236,30 +378,62 @@ class CoverageMonitor:
 
     def pull_gcov_data(self) -> CoverageSnapshot:
         """Flush gcov inside the container, run lcov, pull the .info file,
-        and return a parsed CoverageSnapshot."""
+        and return a parsed CoverageSnapshot.
+
+        All file I/O uses retry logic to handle locked/empty .gcda files
+        that occur when the target is mid-write.
+        """
         self._iteration += 1
 
-        # 1. Flush gcov counters
-        self._exec_in_container(self.gcov_flush_cmd)
+        # 1. Flush gcov counters (retry — the process may be busy)
+        _retry_operation(
+            lambda: self._exec_in_container(self.gcov_flush_cmd),
+            description="gcov flush",
+        )
+
+        # Small delay to let .gcda files finish writing on VirtioFS
+        time.sleep(0.2)
 
         # 2. Run lcov inside container to capture current coverage
         info_filename = f"coverage_{self._iteration}.info"
         container_info_path = f"/tmp/{info_filename}"
 
         lcov_cmd = (
-            f"lcov --capture --directory {self.gcov_prefix} "
+            f"lcov --capture "
+            f"--directory {self.gcov_prefix} "
+            f"--base-directory /usr/src/bind9 "
             f"--output-file {container_info_path} "
             f"--rc lcov_branch_coverage=1 "
+            f"--no-external "
             f"--quiet"
         )
-        self._exec_in_container(lcov_cmd)
+        _retry_operation(
+            lambda: self._exec_in_container(lcov_cmd),
+            description="lcov capture",
+        )
 
-        # 3. Copy .info file from container to local filesystem
+        # 3. Copy .info file from container to local filesystem (retry)
         local_info_path = self.local_lcov_dir / info_filename
-        self._copy_from_container(container_info_path, local_info_path)
+        _retry_operation(
+            lambda: self._copy_from_container(container_info_path, local_info_path),
+            description="docker cp tracefile",
+        )
 
-        # 4. Parse
-        snapshot = LcovParser.parse_file(local_info_path, iteration=self._iteration)
+        # 4. Validate the file isn't empty (transient VirtioFS issue)
+        def _parse_with_validation():
+            size = local_info_path.stat().st_size
+            if size == 0:
+                raise OSError(f"Tracefile is empty (0 bytes): {local_info_path}")
+            return LcovParser.parse_file(
+                local_info_path,
+                iteration=self._iteration,
+                remapper=self._remapper,
+            )
+
+        snapshot = _retry_operation(
+            _parse_with_validation,
+            description="parse tracefile",
+        )
 
         # 5. Update stagnation tracker
         self._path_history.append(snapshot.unique_paths)
@@ -362,6 +536,10 @@ class CoverageMonitor:
     def unique_coverage_hashes_count(self) -> int:
         """How many distinct coverage bitmaps have we observed so far."""
         return len(self._seen_hashes)
+
+    @property
+    def remapper(self) -> PathRemapper | None:
+        return self._remapper
 
     # ------------------------------------------------------------------
     # Docker helpers

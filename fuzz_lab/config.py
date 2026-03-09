@@ -39,6 +39,9 @@ class TargetSpec:
     cves: List[CVEEntry] = field(default_factory=list)
     compile_flags: str = ""           # extra CFLAGS for instrumented build
     rfc_references: List[str] = field(default_factory=list)
+    # Path mapping: container source tree -> host source tree
+    source_dir_container: str = ""   # e.g. /usr/src/bind9
+    source_dir_host: str = ""        # e.g. ./targets/bind9/src (resolved at runtime)
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +193,8 @@ TARGET_CONFIG: Dict[str, TargetSpec] = {
         cves=BIND9_CVES,
         compile_flags="-g -O0 --coverage -fprofile-arcs -ftest-coverage",
         rfc_references=["RFC 1035", "RFC 2136", "RFC 8490", "RFC 2845"],
+        source_dir_container="/usr/src/bind9",
+        source_dir_host="targets/bind9/src",
     ),
     "mosquitto": TargetSpec(
         name="mosquitto",
@@ -204,6 +209,8 @@ TARGET_CONFIG: Dict[str, TargetSpec] = {
         cves=MOSQUITTO_CVES,
         compile_flags="-g -O0 --coverage -fprofile-arcs -ftest-coverage",
         rfc_references=["MQTT v3.1.1 (OASIS)", "MQTT v5.0 (OASIS)"],
+        source_dir_container="/usr/src/mosquitto",
+        source_dir_host="targets/mosquitto/src",
     ),
 }
 
@@ -242,7 +249,12 @@ COVERAGE_CONFIG = {
 
 DOCKER_CONFIG = {
     "network_name": "fuzzlab_net",
-    "mount_type": "bind",           # VirtioFS on macOS handled transparently
+    # On macOS (Docker Desktop 4.x+), VirtioFS is the default filesystem for
+    # bind mounts.  No extra flags needed — Docker Desktop routes bind mounts
+    # through VirtioFS automatically when enabled in Settings > General.
+    # The "consistency" hint is accepted but ignored on VirtioFS.
+    "mount_type": "bind",
+    "mount_consistency": "consistent",  # macOS VirtioFS: delegated/cached/consistent
     "restart_cooldown_sec": 3,
     "health_check_retries": 5,
     "health_check_interval_sec": 1,

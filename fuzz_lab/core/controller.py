@@ -60,8 +60,22 @@ class TargetController:
     # ------------------------------------------------------------------
 
     def start_container(self) -> str:
-        """Start a new container and return its ID."""
+        """Start a new container and return its ID.
+
+        Mount configuration uses VirtioFS on macOS (Docker Desktop routes
+        bind mounts through VirtioFS automatically).  The consistency hint
+        is included for clarity but is a no-op on VirtioFS.
+        """
         cfg = DOCKER_CONFIG
+        consistency = cfg.get("mount_consistency", "consistent")
+
+        # Primary mount: GCOV output directory
+        gcov_mount = (
+            f"type=bind,"
+            f"source={self._gcov_volume.resolve()},"
+            f"target={self.target.gcov_prefix},"
+            f"consistency={consistency}"
+        )
 
         cmd = [
             "docker", "run", "-d",
@@ -69,8 +83,9 @@ class TargetController:
             "--network", cfg["network_name"],
             "--memory", cfg["container_memory_limit"],
             "--cpus", str(cfg["container_cpu_count"]),
-            "-p", f"{self.target.default_port}:{self.target.default_port}",
-            "-v", f"{self._gcov_volume.resolve()}:{self.target.gcov_prefix}",
+            "-p", f"{self.target.default_port}:{self.target.default_port}/udp",
+            "-p", f"{self.target.default_port}:{self.target.default_port}/tcp",
+            "--mount", gcov_mount,
             self.target.docker_image,
         ]
         logger.info("Starting container for %s", self.target.name)
